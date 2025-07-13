@@ -17,13 +17,21 @@ use GuzzleHttp\Exception\GuzzleException;
 use GuzzleHttp\Exception\RequestException;
 use GuzzleHttp\RequestOptions;
 use Workbunny\WebmanPushServer\Events\Subscribe;
-use GuzzleHttp\Client;
+use Amp\Http\Client\Request;
+use Amp\Http\Client\HttpClientBuilder;
+use Amp\Http\Client\Connection\UnlimitedConnectionPool;
+use Amp\Http\Client\Connection\DefaultConnectionFactory;
+use Amp\Http\Client\HttpException;
+use Amp\ByteStream\StreamException;
+use Amp\Http\Client\HttpClient as Client;
+use Amp\TimeoutCancellation;
+use Throwable;
 
 class ApiClient
 {
 
     /** @var Client|null  */
-    protected Client|null $client = null;
+    protected \Amp\Http\Client\HttpClient|null $client = null;
 
     /** @var array  */
     protected array $settings = [
@@ -66,11 +74,11 @@ class ApiClient
      */
     public function getClient(bool $init = false): Client
     {
-        if ($init and !$this->client instanceof Client) {
-            $this->client = new Client([
-                'timeout'  => $this->settings['timeout'],
-                'base_uri' => $this->settings['host']
-            ]);
+        if (!$this->client) {
+            $pool = new UnlimitedConnectionPool(new DefaultConnectionFactory);
+            $this->client = (new HttpClientBuilder)
+                ->usingPool($pool)
+                ->build();
         }
         return $this->client;
     }
@@ -90,29 +98,35 @@ class ApiClient
     {
         $path = $this->settings['base_path'] . $path;
         $queryParams['body_md5'] = md5($body);
+        $queryString = http_build_query($this->sign($path, $method, $queryParams));
+        $url = "{$this->settings['host']}{$path}?{$queryString}";
+
+        $request = new Request($url, $method);
+        $request->setBody($body);
+        $request->setHeader('Content-Type', 'application/json');
+        $request->setHeader('Connection', $this->settings['keep-alive'] ? 'keep-alive' : 'close');
+        $request->setHeader('X-Push-Client', 'push-server ' . VERSION);
+        foreach ($headers as $k => $v) {
+            $request->setHeader($k, $v);
+        }
+
+        // 设置超时时间
+        $timeout = new TimeoutCancellation($this->settings['timeout'] * 1000);
+
         try {
-            $response = $this->getClient()->request($method, $path, [
-                RequestOptions::QUERY       => $this->sign($path, $method, $queryParams),
-                RequestOptions::BODY        => $body,
-                RequestOptions::HEADERS     => [
-                        'Content-Type'  => 'application/json',
-                        'Connection'    => $this->settings['keep-alive'] ? 'keep-alive' : 'close',
-                        'X-Push-Client' => 'push-server ' . VERSION
-                    ] + $headers,
-                RequestOptions::HTTP_ERRORS => true,
-            ]);
-            return json_decode($response->getBody()->getContents(), true);
-        } catch (RequestException $e) {
+            $client = $this->getClient();
+            $response = $client->request($request, $timeout);
+            $body = $response->getBody()->buffer(); // fully reads the response body
+            return json_decode($body, true, flags: JSON_THROW_ON_ERROR);
+        } catch (HttpException|StreamException|Throwable $e) {
             throw new ClientException(
-                $e->getResponse()?->getBody()->getContents() ?: $e->getMessage(),
-                $e->getResponse()?->getStatusCode() ?: 0
-            );
-        } catch (\Throwable $throwable) {
-            throw new ClientException(
-                "Push client request failed. [{$throwable->getMessage()}]", $throwable->getCode(), $throwable
+                "Push client AMP request failed: {$e->getMessage()}",
+                $e->getCode() ?: 0,
+                $e
             );
         }
     }
+
 
     /**
      * @param string $channel
